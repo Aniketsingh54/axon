@@ -2,9 +2,15 @@ import { NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
 import { getLatestRun } from "@/lib/history";
 
-export async function GET(req: Request, { params }: { params: { id: string } }) {
+export const dynamic = 'force-dynamic';
+
+export async function GET(
+    req: Request,
+    { params }: { params: Promise<{ id: string }> }
+) {
     try {
-        const workflowId = params.id;
+        const { id } = await params;
+        const workflowId = id;
         const run = await getLatestRun(workflowId);
 
         if (!run) {

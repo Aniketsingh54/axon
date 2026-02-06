@@ -49,12 +49,12 @@ export function useExecutionPolling(workflowId: string | null) {
 
                         // Update Node Data with Outputs if Success
                         if (exec.status === "SUCCESS" && exec.outputs) {
-                            // We need to be careful not to overwrite user input if it's an input node
-                            // But for LLM/Media nodes, we want to show the output.
-
                             // Logic: Update 'output' field in data
                             // We directly update React Flow nodes via hook
                             updateNodeData(exec.nodeId, { ...exec.outputs });
+
+                            // Also update the store to correct persistence
+                            useWorkflowStore.getState().updateNodeData(exec.nodeId, { ...exec.outputs });
                         }
                     });
                 }

@@ -24,6 +24,7 @@ interface WorkflowState {
     nodeExecutionStatus: Record<string, "idle" | "running" | "success" | "error">;
     setNodeStatus: (nodeId: string, status: "idle" | "running" | "success" | "error") => void;
     setWorkflow: (nodes: Node[], edges: Edge[]) => void;
+    updateNodeData: (nodeId: string, data: Record<string, any>) => void;
 }
 
 export const useWorkflowStore = create<WorkflowState>()(
@@ -62,5 +63,13 @@ export const useWorkflowStore = create<WorkflowState>()(
                 },
             })),
         setWorkflow: (nodes, edges) => set({ nodes, edges }),
+        updateNodeData: (nodeId, data) =>
+            set((state) => ({
+                nodes: state.nodes.map((node) =>
+                    node.id === nodeId
+                        ? { ...node, data: { ...node.data, ...data } }
+                        : node
+                ),
+            })),
     }))
 );

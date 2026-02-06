@@ -1,7 +1,6 @@
-
 import prisma from "@/lib/prisma";
 import { buildExecutionPlan, getInputValues } from "@/lib/engine";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+// import { GoogleGenerativeAI } from "@google/generative-ai"; // Removed
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegPath from "ffmpeg-static";
 import { join } from "path";
@@ -12,7 +11,7 @@ if (ffmpegPath) {
     ffmpeg.setFfmpegPath(ffmpegPath);
 }
 
-const geminiClient = new GoogleGenerativeAI(process.env.GEMINI_API_KEY!);
+const geminiClient = null; // Removed SDK usage
 
 // --- MOCK IO ---
 const mockIO = {
@@ -31,12 +30,22 @@ const mockIO = {
 async function executeLLM(payload: any, io: any, runId: string) {
     await io.logger.info("Starting Gemini Generation", { payload });
 
-    let modelName = payload.model;
-    if (payload.images && payload.images.length > 0) {
-        if (modelName === "gemini-pro") modelName = "gemini-1.5-flash";
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+        throw new Error("GEMINI_API_KEY is not defined");
     }
 
-    const model = geminiClient.getGenerativeModel({ model: modelName });
+    let modelName = payload.model;
+
+    // Sanitize model name
+    if (modelName.startsWith("models/")) {
+        modelName = modelName.replace("models/", "");
+    }
+
+    if (modelName === "gemini-pro" || modelName === "gemini-1.5-flash" || modelName.includes("flash")) {
+        modelName = "gemini-2.5-flash"; // Upgrade to current stable flash
+    }
+
     let resultText = "";
 
     try {
@@ -66,9 +75,9 @@ async function executeLLM(payload: any, io: any, runId: string) {
                         const fs = await import("fs/promises");
                         const data = await fs.readFile(fsPath);
                         return {
-                            inlineData: {
+                            inline_data: {
                                 data: data.toString("base64"),
-                                mimeType: "image/jpeg" // Simple assumption
+                                mime_type: "image/jpeg" // Simple assumption
                             }
                         };
                     }
@@ -80,9 +89,9 @@ async function executeLLM(payload: any, io: any, runId: string) {
                 const buffer = Buffer.from(arrayBuffer);
 
                 return {
-                    inlineData: {
+                    inline_data: {
                         data: buffer.toString("base64"),
-                        mimeType: response.headers.get("content-type") || "image/jpeg"
+                        mime_type: response.headers.get("content-type") || "image/jpeg"
                     }
                 };
             }));
@@ -91,11 +100,38 @@ async function executeLLM(payload: any, io: any, runId: string) {
 
         parts.push({ text: payload.userMessage });
 
-        const result = await model.generateContent(parts);
-        const response = result.response;
-        resultText = response.text();
+        // Construct payload for Gemini API
+        const requestBody = {
+            contents: [
+                {
+                    parts: parts
+                }
+            ]
+        };
 
-        await io.logger.info("Gemini Generation Complete", { resultText });
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
+
+        await io.logger.info("Calling Gemini API (Local)", { apiUrl: `...${modelName}...` });
+
+        const response = await fetch(apiUrl, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify(requestBody)
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`Gemini API Error ${response.status}: ${errorText}`);
+        }
+
+        const data = await response.json();
+
+        // Extract text
+        resultText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+
+        await io.logger.info("Gemini Generation Complete", { resultTextLen: resultText.length });
 
     } catch (error: any) {
         await io.logger.error("Gemini Error", { error: error.message });
@@ -103,7 +139,7 @@ async function executeLLM(payload: any, io: any, runId: string) {
     }
 
     return {
-        text: resultText,
+        output: resultText,
         nodeId: payload.nodeId,
         runId
     };
@@ -217,188 +253,114 @@ export async function executeWorkflowLocally(payload: { workflowId: string, user
         }
     });
 
-    try {
-        // 2. Build Plan
-        const { levels } = buildExecutionPlan(nodes, edges);
+    // 2. Start Execution in Background
+    (async () => {
+        try {
+            // Build Plan
+            const { levels } = buildExecutionPlan(nodes, edges);
 
-        const nodeOutputs: Record<string, any> = {};
+            const nodeOutputs: Record<string, any> = {};
 
-        // 3. Execute Levels
-        for (let i = 0; i < levels.length; i++) {
-            const level = levels[i];
+            // Execute Levels
+            for (let i = 0; i < levels.length; i++) {
+                const level = levels[i];
 
-            await Promise.all(
-                level.map(async (nodeId) => {
-                    const node = nodes.find((n: any) => n.id === nodeId);
-                    if (!node) return;
+                await Promise.all(
+                    level.map(async (nodeId) => {
+                        const node = nodes.find((n: any) => n.id === nodeId);
+                        if (!node) return;
 
-                    await prisma.nodeExecution.create({
-                        data: {
-                            runId: run.id,
-                            nodeId,
-                            status: "RUNNING",
-                            inputs: {},
+                        await prisma.nodeExecution.create({
+                            data: {
+                                runId: run.id,
+                                nodeId,
+                                status: "RUNNING",
+                                inputs: {},
+                            }
+                        });
+
+                        const inputs = getInputValues(nodeId, edges, nodeOutputs);
+                        const mergedData = { ...node.data, ...inputs };
+                        let output: any = null;
+
+                        if (node.type === "llmNode") {
+                            const inputsResolved = {
+                                userMessage: mergedData.user_message || mergedData.userMessage || "",
+                                systemPrompt: mergedData.system_prompt || mergedData.systemPrompt,
+                            };
+
+                            if (!inputsResolved.userMessage && inputsResolved.systemPrompt) {
+                                inputsResolved.userMessage = inputsResolved.systemPrompt;
+                                inputsResolved.systemPrompt = undefined;
+                            }
+
+                            // CALL LOCAL LLM FUNCTION
+                            output = await executeLLM({
+                                nodeId,
+                                model: mergedData.model || "gemini-pro",
+                                systemPrompt: inputsResolved.systemPrompt,
+                                userMessage: inputsResolved.userMessage,
+                                images: mergedData.images
+                            }, io, run.id);
+
+                        } else if (node.type === "cropNode") {
+                            output = await executeMedia({
+                                nodeId,
+                                type: "crop",
+                                inputUrl: mergedData.image_url || mergedData.imageUrl || "",
+                                params: { x: mergedData.x_percent, y: mergedData.y_percent, w: mergedData.width_percent, h: mergedData.height_percent }
+                            }, io, run.id);
+
+                        } else if (node.type === "frameExtractNode") {
+                            output = await executeMedia({
+                                nodeId,
+                                type: "extract_frame",
+                                inputUrl: mergedData.video_url || mergedData.videoUrl || "",
+                                params: { timestamp: mergedData.timestamp }
+                            }, io, run.id);
+                        } else {
+                            // Pass through
+                            output = { ...node.data };
                         }
+
+                        // Update Execution Record
+                        await prisma.nodeExecution.updateMany({
+                            where: { runId: run.id, nodeId },
+                            data: {
+                                status: "SUCCESS",
+                                inputs: JSON.parse(JSON.stringify(inputs)),
+                                outputs: output,
+                                completedAt: new Date(),
+                            }
+                        });
+
+                        // Store output for next level
+                        return { nodeId, output };
+                    })
+                ).then((results) => {
+                    results.forEach((res) => {
+                        if (res) nodeOutputs[res.nodeId] = res.output;
                     });
+                });
+            }
 
-                    const inputs = getInputValues(nodeId, edges, nodeOutputs);
-                    const mergedData = { ...node.data, ...inputs };
-                    let output: any = null;
-
-                    if (node.type === "llmNode") {
-                        const inputsResolved = {
-                            userMessage: mergedData.user_message || mergedData.userMessage || "",
-                            systemPrompt: mergedData.system_prompt || mergedData.systemPrompt,
-                        };
-
-                        if (!inputsResolved.userMessage && inputsResolved.systemPrompt) {
-                            inputsResolved.userMessage = inputsResolved.systemPrompt;
-                            inputsResolved.systemPrompt = undefined;
-                        }
-
-                        // CALL LOCAL LLM FUNCTION
-                        output = await executeLLM({
-                            nodeId,
-                            model: mergedData.model || "gemini-pro",
-                            systemPrompt: inputsResolved.systemPrompt,
-                            userMessage: inputsResolved.userMessage,
-                            images: mergedData.images
-                        }, io, run.id);
-
-                    } else if (node.type === "cropNode") {
-                        output = await executeMedia({
-                            nodeId,
-                            type: "crop",
-                            inputUrl: mergedData.image_url || mergedData.imageUrl || "",
-                            params: { x: mergedData.x_percent, y: mergedData.y_percent, w: mergedData.width_percent, h: mergedData.height_percent }
-                        }, io, run.id);
-
-                    } else if (node.type === "frameExtractNode") {
-                        output = await executeMedia({
-                            nodeId,
-                            type: "extract_frame",
-                            inputUrl: mergedData.video_url || mergedData.videoUrl || "",
-                            params: { timestamp: mergedData.timestamp }
-                        }, io, run.id);
-                    } else {
-                        // Pass through
-                        output = { ...node.data };
-                    }
-
-                    // Update Execution Record
-                    await prisma.nodeExecution.updateMany({
-                        where: { runId: run.id, nodeId },
-                        data: {
-                            status: "SUCCESS",
-                            inputs: JSON.parse(JSON.stringify(inputs)),
-                            outputs: output,
-                            completedAt: new Date(),
-                        }
-                    });
-
-                    // Store output for next level
-                    // Since we are running in same process, we don't need to wrap return
-                    // Just update the map
-                    // Race condition on map? JS is single threaded event loop, map assignment is safe.
-                    // But Promise.all runs concurrently.
-                    // Yes, we just assign to specific key. Safe.
-                })
-            );
-
-            // After level completes, populate nodeOutputs (redundant if done in map, but let's be safe)
-            // Wait, inside map we don't see results from siblings.
-            // We need to collect results.
-
-            // Re-do the loop to collect results properly from Promise.all return
-            // Actually, getInputValues reads from nodeOutputs.
-            // Next level relies on THIS level completing.
-            // So we just need to ensure nodeOutputs is populated before next iteration of 'i'.
-            // My code above doesn't populate nodeOutputs in the map! It only defined 'output'.
-            // FIX:
-
-            // Re-writing the level execution loop to return values
-        }
-
-        // --- RE-WRITING EXECUTION LOOP FOR CORRECTNESS ---
-        // (Self-correction during write)
-        for (let i = 0; i < levels.length; i++) {
-            const level = levels[i];
-            const results = await Promise.all(
-                level.map(async (nodeId) => {
-                    const node = nodes.find((n: any) => n.id === nodeId);
-                    if (!node) return null;
-
-                    // (Create DB record logic same as above)
-                    await prisma.nodeExecution.create({
-                        data: { runId: run.id, nodeId, status: "RUNNING", inputs: {} }
-                    });
-
-                    const inputs = getInputValues(nodeId, edges, nodeOutputs);
-                    const mergedData = { ...node.data, ...inputs };
-                    let output: any = null;
-
-                    // (Dispatch logic same as above)
-                    if (node.type === "llmNode") {
-                        const inputsResolved = {
-                            userMessage: mergedData.user_message || mergedData.userMessage || "",
-                            systemPrompt: mergedData.system_prompt || mergedData.systemPrompt,
-                        };
-                        if (!inputsResolved.userMessage && inputsResolved.systemPrompt) {
-                            inputsResolved.userMessage = inputsResolved.systemPrompt;
-                            inputsResolved.systemPrompt = undefined;
-                        }
-                        output = await executeLLM({
-                            nodeId,
-                            model: mergedData.model || "gemini-pro",
-                            systemPrompt: inputsResolved.systemPrompt,
-                            userMessage: inputsResolved.userMessage,
-                            images: mergedData.images
-                        }, io, run.id);
-                    } else if (node.type === "cropNode") {
-                        output = await executeMedia({
-                            nodeId, type: "crop",
-                            inputUrl: mergedData.image_url || mergedData.imageUrl || "",
-                            params: { x: mergedData.x_percent, y: mergedData.y_percent, w: mergedData.width_percent, h: mergedData.height_percent }
-                        }, io, run.id);
-                    } else if (node.type === "frameExtractNode") {
-                        output = await executeMedia({
-                            nodeId, type: "extract_frame",
-                            inputUrl: mergedData.video_url || mergedData.videoUrl || "",
-                            params: { timestamp: mergedData.timestamp }
-                        }, io, run.id);
-                    } else {
-                        output = { ...node.data };
-                    }
-
-                    await prisma.nodeExecution.updateMany({
-                        where: { runId: run.id, nodeId },
-                        data: { status: "SUCCESS", inputs: JSON.parse(JSON.stringify(inputs)), outputs: output, completedAt: new Date() }
-                    });
-
-                    return { nodeId, output };
-                })
-            );
-
-            // Populate nodeOutputs
-            results.forEach(res => {
-                if (res) nodeOutputs[res.nodeId] = res.output;
+            // 4. Mark Run Complete
+            await prisma.workflowRun.update({
+                where: { id: run.id },
+                data: { status: "COMPLETED", completedAt: new Date() }
             });
+
+        } catch (error: any) {
+            await io.logger.error("Workflow Failed", { error });
+            await prisma.workflowRun.update({
+                where: { id: run.id },
+                data: { status: "FAILED", completedAt: new Date() }
+            });
+            // We don't throw here to avoid crashing the background process, just log
+            console.error(error);
         }
+    })();
 
-        // 4. Mark Run Complete
-        await prisma.workflowRun.update({
-            where: { id: run.id },
-            data: { status: "COMPLETED", completedAt: new Date() }
-        });
-
-        return run;
-
-    } catch (error: any) {
-        await io.logger.error("Workflow Failed", { error });
-        await prisma.workflowRun.update({
-            where: { id: run.id },
-            data: { status: "FAILED", completedAt: new Date() }
-        });
-        throw error;
-    }
+    // Return immediately
+    return run;
 }
